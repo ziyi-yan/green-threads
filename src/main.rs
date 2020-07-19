@@ -11,7 +11,7 @@ use std::ptr;
 
 use rayon;
 
-const DEFAULT_STACK_SIZE: usize = 1024 * 2;
+const DEFAULT_STACK_SIZE: usize = 1024 * 1024 * 2;
 
 /// Runtime schedule and switch threads.
 pub struct Runtime {
@@ -73,12 +73,9 @@ impl Runtime {
     }
     /// run all machines in their own thread
     pub fn run(&mut self) {
-        while self.machines[0].t_yield() {}
         rayon::scope(|s| {
             for m in self.machines.iter_mut() {
-                s.spawn(move |_| {
-                    while m.t_yield() {}
-                });
+                s.spawn(move |_| while m.t_yield() {});
             }
         })
     }
