@@ -64,7 +64,7 @@ impl Runtime {
         }
     }
     /// spawn a coroutine, spread them equally
-    pub fn spawn(&mut self, r: fn(&mut Machine) -> RReturn) {
+    pub fn spawn(&mut self, r: fn(&mut Machine)) {
         self.machines[self.current].spawn(r);
         self.current += 1;
         if self.current == self.machines.len() {
@@ -132,7 +132,7 @@ impl Machine {
     }
 
     /// spawn a function to be executed by runtime
-    fn spawn(&mut self, f: fn(&mut Machine) -> RReturn) {
+    fn spawn(&mut self, f: fn(&mut Machine)) {
         let mut available = Task::new();
 
         let size = available.stack.len();
@@ -140,13 +140,31 @@ impl Machine {
 
         unsafe {
             let m_ptr: *const Machine = self;
-            ptr::write(s_ptr.offset((size - 0x10) as isize) as *mut u64, f as u64);
+            ptr::write(s_ptr.offset((size - 0x20) as isize) as *mut u64, f as u64);
+            ptr::write(
+                s_ptr.offset((size - 0x18) as isize) as *mut u64,
+                guard as u64,
+            );
+            ptr::write(
+                s_ptr.offset((size - 0x08) as isize) as *mut u64,
+                m_ptr as u64,
+            );
 
-            available.ctx.rsp = s_ptr.offset((size - 0x10) as isize) as u64;
+            available.ctx.rsp = s_ptr.offset((size - 0x20) as isize) as u64;
             available.ctx.rdi = m_ptr as u64;
         }
         self.queue.push_back(available);
     }
+}
+
+#[naked]
+unsafe fn guard(rt: &mut Machine) {
+    llvm_asm!(
+        "
+    mov     0x08(%rsp), %rdi
+    "
+    );
+    rt.t_return();
 }
 
 #[naked]
@@ -190,7 +208,6 @@ fn main() {
             rt.t_yield();
         }
         println!("THREAD 1 FINISHED");
-        rt.t_return()
     });
     runtime.spawn(|rt| {
         let id = 2;
@@ -199,13 +216,12 @@ fn main() {
             rt.t_yield();
         }
         println!("THREAD 2 FINISHED");
-        rt.t_return()
     });
-    for _ in 0..100 {
+    runtime.spawn(|rt| {});
+    for _ in 0..10 {
         runtime.spawn(|rt| {
             rt.t_yield();
             println!("THREAD mass FINISHED");
-            rt.t_return()
         });
     }
     runtime.run();
