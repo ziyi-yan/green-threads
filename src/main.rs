@@ -45,6 +45,7 @@ struct ThreadContext {
     r12: u64,
     rbx: u64,
     rbp: u64,
+    rdi: u64,
 }
 
 struct Task {
@@ -112,6 +113,11 @@ impl Task {
     }
 }
 
+fn cb(foo: fn()) {
+    foo();
+    guard();
+}
+
 impl Machine {
     /// Initialize with a base thread.
     fn new() -> Self {
@@ -155,26 +161,27 @@ impl Machine {
     /// spawn a function to be executed by runtime
     fn spawn(&mut self, f: fn()) {
         let mut available = Task::new();
-
-        let size = available.stack.len();
         let s_ptr = available.stack.as_mut_ptr();
+        self.queue.push_back(available);
+        let last_index = self.queue.len() - 1;
+        let last = &mut self.queue[last_index];
+
+        let size = last.stack.len();
 
         unsafe {
-            ptr::write(s_ptr.offset((size - 0x40) as isize) as *mut u64, f as u64);
-            ptr::write(
-                s_ptr.offset((size - 0x38) as isize) as *mut u64,
-                guard as u64,
-            );
+            ptr::write(s_ptr.offset((size - 0x10) as isize) as *mut u64, cb as u64);
 
-            available.ctx.rsp = s_ptr.offset((size - 0x40) as isize) as u64;
+            last.ctx.rdi = f as u64;
+            last.ctx.rsp = s_ptr.offset((size - 0x10) as isize) as u64;
         }
-        self.queue.push_back(available);
     }
 }
 
-unsafe fn guard() {
-    let rt_ptr = RUNTIME as *mut Runtime;
-    (*rt_ptr).t_return();
+fn guard() {
+    unsafe {
+        let rt_ptr = RUNTIME as *mut Runtime;
+        (*rt_ptr).t_return()
+    };
 }
 
 /// yield_thread is a helper function that lets us call yield from an arbitrary place in our code.
@@ -196,6 +203,7 @@ unsafe fn switch(old: *mut ThreadContext, new: *const ThreadContext) {
         mov     %r12, 0x20($0)
         mov     %rbx, 0x28($0)
         mov     %rbp, 0x30($0)
+        mov     %rdi, 0x38($0)
 
         mov     0x00($1), %rsp
         mov     0x08($1), %r15
@@ -204,6 +212,7 @@ unsafe fn switch(old: *mut ThreadContext, new: *const ThreadContext) {
         mov     0x20($1), %r12
         mov     0x28($1), %rbx
         mov     0x30($1), %rbp
+        mov     0x38($1), %rdi
         ret
         "
     :
