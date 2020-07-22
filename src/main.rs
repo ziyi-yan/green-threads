@@ -169,12 +169,16 @@ impl Machine {
         let size = last.stack.len();
 
         unsafe {
-            ptr::write(s_ptr.offset((size - 0x10) as isize) as *mut u64, cb as u64);
+            ptr::write(s_ptr.offset((size - 0x20) as isize) as *mut u64, f as u64);
+            ptr::write(s_ptr.offset((size - 0x18) as isize) as *mut u64, skip as u64);
+            ptr::write(s_ptr.offset((size - 0x10) as isize) as *mut u64, guard as u64);
 
-            last.ctx.rdi = f as u64;
-            last.ctx.rsp = s_ptr.offset((size - 0x10) as isize) as u64;
+            last.ctx.rsp = s_ptr.offset((size - 0x20) as isize) as u64;
         }
     }
+}
+
+fn skip() {
 }
 
 fn guard() {
