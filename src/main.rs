@@ -149,13 +149,18 @@ impl Runtime {
         unsafe {
             // put the f to the 16 bytes aligned position.
             ptr::write(s_ptr.offset((size - 32) as isize) as *mut u64, f as u64);
-            // put the guard 1 byte next to the f for being executed after f returned.
-            ptr::write(s_ptr.offset((size - 24) as isize) as *mut u64, guard as u64);
+            // skip 8 bytes on stack for 16-bytes alignment while guard is running.
+            ptr::write(s_ptr.offset((size - 24) as isize) as *mut u64, skip as u64);
+            // put the guard next to the skip for being executed after skip returned.
+            ptr::write(s_ptr.offset((size - 16) as isize) as *mut u64, guard as u64);
 
             available.ctx.rsp = s_ptr.offset((size - 32) as isize) as u64;
         }
         available.state = State::Ready;
     }
+}
+
+fn skip() {
 }
 
 fn guard() {
