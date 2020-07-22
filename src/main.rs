@@ -4,27 +4,32 @@
 #![deny(missing_docs)]
 #![feature(llvm_asm)]
 #![feature(naked_functions)]
+#![feature(thread_local)]
 
+use std::collections::VecDeque;
+use std::mem;
 use std::ptr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-const DEFAULT_STACK_SIZE: usize = 1024 * 1024 * 2;
-const MAX_THREADS: usize = 4;
+use rayon;
+
+const DEFAULT_STACK_SIZE: usize = 1024 * 1 * 2;
 static mut RUNTIME: usize = 0;
 
-/// Runtime schedule and switch threads. current is the id of thread which is currently running.
+#[thread_local]
+#[no_mangle]
+static WORKER_ID: AtomicUsize = AtomicUsize::new(!1);
+
+/// Runtime schedule and switch threads.
 pub struct Runtime {
-    threads: Vec<Thread>,
     current: usize,
+    machines: Vec<Machine>,
 }
 
-#[derive(PartialEq, Eq, Debug)]
-enum State {
-    // available and ready to be assigned a task if needed
-    Available,
-    // running
-    Running,
-    // ready to move forward and resume execution
-    Ready,
+/// This is the real thing running in the cores
+pub struct Machine {
+    queue: VecDeque<Task>,
+    current: Task,
 }
 
 /// ThreadContext contains the registers marked as "callee-saved" (preserved across calls)
@@ -40,129 +45,143 @@ struct ThreadContext {
     r12: u64,
     rbx: u64,
     rbp: u64,
+    rdi: u64,
 }
 
-struct Thread {
-    id: usize,
+struct Task {
     stack: Vec<u8>,
     ctx: ThreadContext,
-    state: State,
-}
-
-impl Thread {
-    fn new(id: usize) -> Self {
-        Thread {
-            id,
-            stack: vec![0_u8; DEFAULT_STACK_SIZE],
-            ctx: ThreadContext::default(),
-            state: State::Available,
-        }
-    }
-
-    fn new_with_state(id: usize, state: State) -> Self {
-        Thread {
-            id,
-            stack: vec![0_u8; DEFAULT_STACK_SIZE],
-            ctx: ThreadContext::default(),
-            state,
-        }
-    }
 }
 
 impl Runtime {
-    /// Initialize with a base thread.
+    /// initialize runtime with machines same numbers as cpu cores
     pub fn new() -> Self {
-        let base_thread_id = 0;
-        let base_thread = Thread::new_with_state(base_thread_id, State::Running);
-
-        let mut threads = vec![base_thread];
-        let mut available_threads = (1..MAX_THREADS).map(|i| Thread::new(i)).collect();
-        threads.append(&mut available_threads);
-
+        let mut machines = Vec::new();
+        let cpus = num_cpus::get();
+        for _ in 0..cpus {
+            machines.push(Machine::new());
+        }
         Runtime {
-            threads,
-            current: base_thread_id,
+            current: 0,
+            machines,
         }
     }
-
-    /// This is cheating a bit, but we need a pointer to our Runtime
-    /// stored so we can call yield on it even if we don't have a
-    /// reference to it.
+    /// store the pointer to runtime
     pub fn init(&self) {
         unsafe {
             let r_ptr: *const Runtime = self;
             RUNTIME = r_ptr as usize;
         }
     }
+    /// spawn a coroutine, spread them equally
+    pub fn spawn(&mut self, r: fn()) {
+        self.machines[self.current].spawn(r);
+        self.current += 1;
+        if self.current == self.machines.len() {
+            self.current = 0;
+        }
+    }
+    /// run all machines in their own thread
+    pub fn run(&mut self) {
+        rayon::scope(|s| {
+            let mut i = 0;
+            for m in self.machines.iter_mut() {
+                s.spawn(move |_| {
+                    WORKER_ID.store(i, Ordering::Relaxed);
+                    while m.t_yield() {}
+                });
+                i += 1;
+            }
+        })
+    }
+    fn t_return(&mut self) {
+        let id = WORKER_ID.load(Ordering::Relaxed);
+        self.machines[id].t_return();
+    }
+    fn t_yield(&mut self) {
+        let id = WORKER_ID.load(Ordering::Relaxed);
+        self.machines[id].t_yield();
+    }
+}
 
-    /// start the runtime
-    pub fn run(&mut self) -> ! {
-        while self.t_yield() {}
-        std::process::exit(0);
+impl Task {
+    fn new() -> Self {
+        Task {
+            stack: vec![0_u8; DEFAULT_STACK_SIZE],
+            ctx: ThreadContext::default(),
+        }
+    }
+}
+
+fn cb(foo: fn()) {
+    foo();
+    guard();
+}
+
+impl Machine {
+    /// Initialize with a base thread.
+    fn new() -> Self {
+        let base_r = Task::new();
+
+        Machine {
+            queue: VecDeque::new(),
+            current: base_r,
+        }
     }
 
+    // force call t_return
     fn t_return(&mut self) {
-        if self.current != 0 {
-            self.threads[self.current].state = State::Available;
-            self.t_yield();
+        if self.queue.len() == 0 {
+            return;
+        }
+        let mut next = self.queue.pop_front().unwrap();
+        mem::swap(&mut next, &mut self.current);
+
+        unsafe {
+            switch(&mut next.ctx, &self.current.ctx);
         }
     }
 
     fn t_yield(&mut self) -> bool {
-        let mut pos = self.current;
-        while self.threads[pos].state != State::Ready {
-            pos += 1;
-            if pos == self.threads.len() {
-                pos = 0;
-            }
-            if pos == self.current {
-                return false;
-            }
+        if self.queue.len() == 0 {
+            return false;
         }
-
-        if self.threads[self.current].state != State::Available {
-            self.threads[self.current].state = State::Ready;
-        }
-
-        self.threads[pos].state = State::Running;
-        let old_pos = self.current;
-        self.current = pos;
+        let mut next = self.queue.pop_front().unwrap();
+        mem::swap(&mut next, &mut self.current);
+        self.queue.push_back(next);
 
         unsafe {
-            switch(&mut self.threads[old_pos].ctx, &self.threads[pos].ctx);
+            let last = self.queue.len() - 1;
+            switch(&mut self.queue[last].ctx, &self.current.ctx);
         }
         // Prevents compiler from optimizing our code away on Windows.
-        self.threads.len() > 0
+        self.queue.len() > 0
     }
 
     /// spawn a function to be executed by runtime
-    pub fn spawn(&mut self, f: fn()) {
-        let available = self
-            .threads
-            .iter_mut()
-            .find(|t| t.state == State::Available)
-            .expect("no available thread.");
-
-        let size = available.stack.len();
+    fn spawn(&mut self, f: fn()) {
+        let mut available = Task::new();
         let s_ptr = available.stack.as_mut_ptr();
+        self.queue.push_back(available);
+        let last_index = self.queue.len() - 1;
+        let last = &mut self.queue[last_index];
+
+        let size = last.stack.len();
 
         unsafe {
-            // put the f to the 16 bytes aligned position.
-            ptr::write(s_ptr.offset((size - 32) as isize) as *mut u64, f as u64);
-            // put the guard 1 byte next to the f for being executed after f returned.
-            ptr::write(s_ptr.offset((size - 24) as isize) as *mut u64, guard as u64);
+            ptr::write(s_ptr.offset((size - 0x10) as isize) as *mut u64, cb as u64);
 
-            available.ctx.rsp = s_ptr.offset((size - 32) as isize) as u64;
+            last.ctx.rdi = f as u64;
+            last.ctx.rsp = s_ptr.offset((size - 0x10) as isize) as u64;
         }
-        available.state = State::Ready;
     }
 }
 
 fn guard() {
     unsafe {
         let rt_ptr = RUNTIME as *mut Runtime;
-        (*rt_ptr).t_return();
-    }
+        (*rt_ptr).t_return()
+    };
 }
 
 /// yield_thread is a helper function that lets us call yield from an arbitrary place in our code.
@@ -184,6 +203,7 @@ unsafe fn switch(old: *mut ThreadContext, new: *const ThreadContext) {
         mov     %r12, 0x20($0)
         mov     %rbx, 0x28($0)
         mov     %rbp, 0x30($0)
+        mov     %rdi, 0x38($0)
 
         mov     0x00($1), %rsp
         mov     0x08($1), %r15
@@ -192,6 +212,7 @@ unsafe fn switch(old: *mut ThreadContext, new: *const ThreadContext) {
         mov     0x20($1), %r12
         mov     0x28($1), %rbx
         mov     0x30($1), %rbp
+        mov     0x38($1), %rdi
         ret
         "
     :
@@ -205,7 +226,6 @@ fn main() {
     let mut runtime = Runtime::new();
     runtime.init();
     runtime.spawn(|| {
-        println!("THREAD 1 STARTING");
         let id = 1;
         for i in 0..10 {
             println!("thread: {} counter: {}", id, i);
@@ -214,7 +234,6 @@ fn main() {
         println!("THREAD 1 FINISHED");
     });
     runtime.spawn(|| {
-        println!("THREAD 2 STARTING");
         let id = 2;
         for i in 0..15 {
             println!("thread: {} counter: {}", id, i);
@@ -222,5 +241,15 @@ fn main() {
         }
         println!("THREAD 2 FINISHED");
     });
+
+    runtime.spawn(|| {});
+    runtime.spawn(|| return);
+
+    for _ in 0..10 {
+        runtime.spawn(|| {
+            yield_thread();
+            println!("THREAD mass FINISHED");
+        });
+    }
     runtime.run();
 }
