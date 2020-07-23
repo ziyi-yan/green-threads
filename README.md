@@ -4,7 +4,8 @@ The 200-line implementation of green threads from [this tutorial](https://cfsams
 
 # TODO
 - [ ] [Growable stacks](https://blog.cloudflare.com/how-stacks-are-handled-in-go/)
-- [ ] [x86-64 psABI stack layout and calling convention](https://github.com/hjl-tools/x86-psABI/wiki/X86-psABI)
-    - how %rsp register works in stack construction in `spawn()`
+- [X] [x86-64 psABI stack layout and calling convention](https://github.com/hjl-tools/x86-psABI/wiki/X86-psABI)
+    - Q: how %rsp register works in stack construction in `spawn()`
         - when `ret`
         - when to move to next byte
+    - A: Princeton COS217 [slide](https://www.cs.princeton.edu/courses/archive/spr16/cos217/lectures/15_AssemblyFunctions.pdf) on "Assembly Langauge: Function Calls"
