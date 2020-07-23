@@ -102,6 +102,7 @@ impl Runtime {
     }
 
     fn t_return(&mut self) {
+        println!("t_return");
         if self.current != 0 {
             self.threads[self.current].state = State::Available;
             self.t_yield();
