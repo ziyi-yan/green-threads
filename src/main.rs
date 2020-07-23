@@ -8,17 +8,17 @@
 
 use std::collections::VecDeque;
 use std::mem;
-use std::ptr;
-use std::sync::atomic::{AtomicUsize, Ordering};
-
-use rayon;
+use std::{
+    ptr,
+    sync::{Mutex, MutexGuard},
+};
 
 const DEFAULT_STACK_SIZE: usize = 1024 * 1 * 2;
 static mut RUNTIME: usize = 0;
 
 #[thread_local]
 #[no_mangle]
-static WORKER_ID: AtomicUsize = AtomicUsize::new(!1);
+static mut WORKER_ID: usize = 0;
 
 /// Runtime schedule and switch threads.
 pub struct Runtime {
@@ -28,7 +28,7 @@ pub struct Runtime {
 
 /// This is the real thing running in the cores
 pub struct Machine {
-    queue: VecDeque<Task>,
+    queue: Mutex<VecDeque<Task>>,
     current: Task,
 }
 
@@ -45,7 +45,6 @@ struct ThreadContext {
     r12: u64,
     rbx: u64,
     rbp: u64,
-    rdi: u64,
 }
 
 struct Task {
@@ -87,20 +86,18 @@ impl Runtime {
             let mut i = 0;
             for m in self.machines.iter_mut() {
                 s.spawn(move |_| {
-                    WORKER_ID.store(i, Ordering::Relaxed);
+                    unsafe { WORKER_ID = i };
                     while m.t_yield() {}
                 });
                 i += 1;
             }
         })
     }
-    fn t_return(&mut self) {
-        let id = WORKER_ID.load(Ordering::Relaxed);
-        self.machines[id].t_return();
+    unsafe fn t_return(&mut self) {
+        self.machines[WORKER_ID].t_return();
     }
-    fn t_yield(&mut self) {
-        let id = WORKER_ID.load(Ordering::Relaxed);
-        self.machines[id].t_yield();
+    unsafe fn t_yield(&mut self) {
+        self.machines[WORKER_ID].t_yield();
     }
 }
 
@@ -113,110 +110,154 @@ impl Task {
     }
 }
 
-fn cb(foo: fn()) {
-    foo();
-    guard();
-}
-
 impl Machine {
     /// Initialize with a base thread.
     fn new() -> Self {
         let base_r = Task::new();
 
         Machine {
-            queue: VecDeque::new(),
+            queue: Mutex::new(VecDeque::new()),
             current: base_r,
         }
     }
 
-    // force call t_return
     fn t_return(&mut self) {
-        if self.queue.len() == 0 {
-            return;
+        let mut queue = self.queue.lock().unwrap();
+
+        // there will always be a base task to store what's in original stack
+        if queue.len() == 1 {
+            let rt = get_rt();
+            for m in rt.machines.iter_mut() {
+                match m.queue.try_lock() {
+                    Ok(mut local_q) => {
+                        if local_q.len() > 1 {
+                            let stolen = local_q.pop_front().unwrap();
+                            println!("STEAL!");
+                            queue.push_front(stolen);
+                        }
+                    }
+                    Err(_) => (),
+                }
+            }
         }
-        let mut next = self.queue.pop_front().unwrap();
+
+        let mut next = queue.pop_front().unwrap();
         mem::swap(&mut next, &mut self.current);
 
         unsafe {
-            switch(&mut next.ctx, &self.current.ctx);
+            switch_old(&mut next.ctx);
+            switch_new(&mut next.ctx, &mut self.current.ctx, queue);
         }
     }
 
     fn t_yield(&mut self) -> bool {
-        if self.queue.len() == 0 {
+        let mut queue = self.queue.lock().unwrap();
+        if queue.len() == 0 {
             return false;
         }
-        let mut next = self.queue.pop_front().unwrap();
+        let mut next = queue.pop_front().unwrap();
         mem::swap(&mut next, &mut self.current);
-        self.queue.push_back(next);
+        queue.push_back(next);
 
         unsafe {
-            let last = self.queue.len() - 1;
-            switch(&mut self.queue[last].ctx, &self.current.ctx);
+            let last = queue.len() - 1;
+            switch_old(&mut queue[last].ctx);
+            switch_new(&mut queue[last].ctx, &mut self.current.ctx, queue);
         }
         // Prevents compiler from optimizing our code away on Windows.
-        self.queue.len() > 0
+        // self.queue.len() > 0
+        true
     }
 
     /// spawn a function to be executed by runtime
     fn spawn(&mut self, f: fn()) {
         let mut available = Task::new();
         let s_ptr = available.stack.as_mut_ptr();
-        self.queue.push_back(available);
-        let last_index = self.queue.len() - 1;
-        let last = &mut self.queue[last_index];
+
+        let mut queue = self.queue.lock().unwrap();
+        queue.push_back(available);
+        let last_index = queue.len() - 1;
+        let last = &mut queue[last_index];
 
         let size = last.stack.len();
 
         unsafe {
             ptr::write(s_ptr.offset((size - 0x20) as isize) as *mut u64, f as u64);
-            ptr::write(s_ptr.offset((size - 0x18) as isize) as *mut u64, skip as u64);
-            ptr::write(s_ptr.offset((size - 0x10) as isize) as *mut u64, guard as u64);
+            ptr::write(
+                s_ptr.offset((size - 0x18) as isize) as *mut u64,
+                skip as u64,
+            );
+            ptr::write(
+                s_ptr.offset((size - 0x10) as isize) as *mut u64,
+                guard as u64,
+            );
 
             last.ctx.rsp = s_ptr.offset((size - 0x20) as isize) as u64;
         }
     }
 }
 
-fn skip() {
+fn skip() {}
+
+fn get_rt<'a>() -> &'a mut Runtime {
+    unsafe { &mut *(RUNTIME as *mut Runtime) }
 }
 
 fn guard() {
-    unsafe {
-        let rt_ptr = RUNTIME as *mut Runtime;
-        (*rt_ptr).t_return()
-    };
+    unsafe { get_rt().t_return() };
 }
 
 /// yield_thread is a helper function that lets us call yield from an arbitrary place in our code.
 pub fn yield_thread() {
     unsafe {
-        let rt_ptr = RUNTIME as *mut Runtime;
-        (*rt_ptr).t_yield();
+        get_rt().t_yield();
     };
 }
 
 #[naked]
 #[inline(never)]
-unsafe fn switch(old: *mut ThreadContext, new: *const ThreadContext) {
+unsafe fn switch_old(
+    old: *mut ThreadContext,
+) {
     llvm_asm!("
-        mov     %rsp, 0x00($0)
         mov     %r15, 0x08($0)
         mov     %r14, 0x10($0)
         mov     %r13, 0x18($0)
         mov     %r12, 0x20($0)
         mov     %rbx, 0x28($0)
         mov     %rbp, 0x30($0)
-        mov     %rdi, 0x38($0)
+        "
+    :
+    :"r"(old)
+    :
+    : "volatile", "alignstack"
+    );
+}
 
-        mov     0x00($1), %rsp
-        mov     0x08($1), %r15
-        mov     0x10($1), %r14
-        mov     0x18($1), %r13
-        mov     0x20($1), %r12
-        mov     0x28($1), %rbx
-        mov     0x30($1), %rbp
-        mov     0x38($1), %rdi
+#[naked]
+#[inline(never)]
+unsafe fn switch_new(
+    old: *mut ThreadContext,
+    new: *mut ThreadContext,
+    label: MutexGuard<VecDeque<Task>>,
+) {
+    llvm_asm!("mov     %rsp, 0x00($0)
+    push    %rsi":
+    :"r"(old)
+    :
+    : "volatile", "alignstack"
+    );
+    mem::drop(label);
+
+    llvm_asm!("
+        pop     %rsi
+        mov     0x00(%rsi), %rsp
+        mov     0x08(%rsi), %r15
+        mov     0x10(%rsi), %r14
+        mov     0x18(%rsi), %r13
+        mov     0x20(%rsi), %r12
+        mov     0x28(%rsi), %rbx
+        mov     0x30(%rsi), %rbp
         ret
         "
     :
