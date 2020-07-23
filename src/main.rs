@@ -8,12 +8,12 @@
 
 use std::collections::VecDeque;
 use std::mem;
-use std::{
-    ptr,
-    sync::{Mutex, MutexGuard},
-};
+use std::ptr;
+use std::sync::{Mutex, MutexGuard};
 
-const DEFAULT_STACK_SIZE: usize = 1024 * 1 * 2;
+use rayon;
+
+const DEFAULT_STACK_SIZE: usize = 1024 * 1024 * 2;
 static mut RUNTIME: usize = 0;
 
 #[thread_local]
@@ -216,9 +216,7 @@ pub fn yield_thread() {
 
 #[naked]
 #[inline(never)]
-unsafe fn switch_old(
-    old: *mut ThreadContext,
-) {
+unsafe fn switch_old(old: *mut ThreadContext) {
     llvm_asm!("
         mov     %r15, 0x08($0)
         mov     %r14, 0x10($0)
