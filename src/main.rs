@@ -215,7 +215,7 @@ pub fn yield_thread() {
 }
 
 #[naked]
-#[inline(never)]
+#[inline(always)]
 unsafe fn switch_old(old: *mut ThreadContext) {
     llvm_asm!("
         mov     %r15, 0x08($0)
@@ -239,12 +239,15 @@ unsafe fn switch_new(
     new: *mut ThreadContext,
     label: MutexGuard<VecDeque<Task>>,
 ) {
-    llvm_asm!("mov     %rsp, 0x00($0)
-    push    %rsi":
+    llvm_asm!("
+        mov     %rsp, 0x00($0)
+        push    %rsi"
+    :
     :"r"(old)
     :
     : "volatile", "alignstack"
     );
+
     mem::drop(label);
 
     llvm_asm!("
@@ -259,7 +262,7 @@ unsafe fn switch_new(
         ret
         "
     :
-    :"r"(old), "r"(new)
+    :"r"(new)
     :
     : "volatile", "alignstack"
     );
