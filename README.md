@@ -9,3 +9,8 @@ The 200-line implementation of green threads from [this tutorial](https://cfsams
         - when `ret`
         - when to move to next byte
     - A: Princeton COS217 [slide](https://www.cs.princeton.edu/courses/archive/spr16/cos217/lectures/15_AssemblyFunctions.pdf) on "Assembly Langauge: Function Calls"
+- [X] why `#[inline(never)]` for `switch()`?
+    - It's for stack alignment.
+
+      In the perspective of one task, `call switch` sub `%rsp` for storing the `%rip` when suspended.
+      When it's resumed, `ret` add `%rsp` back to the original aligned address.
